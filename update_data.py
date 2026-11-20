@@ -24,17 +24,70 @@ def download(url,params=None,secs=30):
             error=e;print('Retry',i+1, url, type(e).__name__,flush=True);time.sleep(1+i*2)
     raise RuntimeError(f'공식 데이터 조회 실패: {url}: {error}')
 
-def fred(code):
-    # FRED graph CSV endpoint is public and does not require an API key.
-    r=download('https://fred.stlouisfed.org/graph/fredgraph.csv',{'id':code,'cosd':START})
+def _validate_fred_series(code, out, source):
+    """Reject invalid or stale alternative data rather than silently changing the chart."""
+    out=out.sort_index()
+    out=out[~out.index.duplicated(keep='last')]
+    out=out[out.index>=pd.Timestamp(START)]
+    if out.empty or len(out)<100:
+        raise ValueError(f'{code} {source}: insufficient observations ({len(out)})')
+    age=(pd.Timestamp.now(tz='UTC').tz_localize(None).normalize()-out.index.max()).days
+    # WALCL and WRESBAL are weekly; a longer bound permits holiday/reporting lag.
+    maximum_age=17 if code in ('WALCL','WRESBAL') else 10
+    if age<0 or age>maximum_age:
+        raise ValueError(f'{code} {source}: stale data, latest={out.index.max().date()}, age={age} days')
+    return out
+
+
+def _fred_graph(code):
+    # FRED direct source (API key not required). This host has timed out on GitHub Actions.
+    r=download('https://fred.stlouisfed.org/graph/fredgraph.csv',
+               {'id':code,'cosd':START},secs=10)
     d=pd.read_csv(io.BytesIO(r.content),na_values=['.'])
     d.columns=[str(c).strip().upper() for c in d.columns]
     dcol='OBSERVATION_DATE' if 'OBSERVATION_DATE' in d else 'DATE'
-    if code not in d: raise ValueError(f'{code} FRED response invalid: {list(d)}')
-    d[dcol]=pd.to_datetime(d[dcol],errors='coerce');d[code]=pd.to_numeric(d[code],errors='coerce')
-    out=d.dropna(subset=[dcol,code]).set_index(dcol)[code].sort_index()
-    if out.empty or (pd.Timestamp.today().normalize()-out.index.max()).days>17:raise ValueError(f'{code} is stale')
-    return out
+    if code not in d or dcol not in d: raise ValueError(f'{code} invalid FRED CSV columns')
+    d[dcol]=pd.to_datetime(d[dcol],errors='coerce')
+    d[code]=pd.to_numeric(d[code],errors='coerce')
+    return _validate_fred_series(code,d.dropna(subset=[dcol,code]).set_index(dcol)[code], 'FRED')
+
+
+def _dbnomics_fred(code):
+    # DBnomics is an independent aggregator/mirror, not the official FRED service.
+    # Its FRED series preserve the original series ID and measurement units.
+    url=f'https://api.db.nomics.world/v22/series/FRED/{code}'
+    r=S.get(url,params={'observations':'1'},timeout=(10,22))
+    r.raise_for_status()
+    body=r.json()
+    docs=body.get('series',{}).get('docs',[])
+    if len(docs)!=1: raise ValueError(f'{code} DBnomics: expected exactly one series')
+    doc=docs[0]
+    periods=doc.get('period',[])
+    vals=doc.get('value',[])
+    if len(periods)!=len(vals) or not periods:
+        raise ValueError(f'{code} DBnomics: malformed observation arrays')
+    dates=pd.to_datetime(pd.Series(periods),errors='coerce')
+    numbers=pd.to_numeric(pd.Series(vals),errors='coerce')
+    out=pd.Series(numbers.to_numpy(),index=pd.DatetimeIndex(dates),name=code)
+    out=out.dropna()
+    return _validate_fred_series(code,out,'DBnomics FRED mirror')
+
+
+def fred(code):
+    # Independent mirror first due to repeated FRED host timeouts on the user's runner.
+    # Never treat an old mirror snapshot as up-to-date.
+    errors=[]
+    for label,func in [('DBnomics FRED mirror',_dbnomics_fred),
+                       ('FRED direct',_fred_graph)]:
+        try:
+            print(f'[{code}] Fetching {label}',flush=True)
+            values=func(code)
+            print(f'[{code}] OK via {label}, latest={values.index.max().date()}, n={len(values)}',flush=True)
+            return values
+        except (requests.RequestException,ValueError,RuntimeError,KeyError,TypeError) as exc:
+            print(f'[{code}] {label} failed: {type(exc).__name__}: {exc}',flush=True)
+            errors.append(f'{label}: {type(exc).__name__}: {exc}')
+    raise RuntimeError(f'{code} both providers failed: '+'; '.join(errors))
 
 def treasury():
     """Load every DTS API page, including pre-2021 Federal Reserve Account naming.
@@ -104,7 +157,7 @@ def main():
     d['NASDAQ_Index_100']=100*d['NASDAQCOM']/d['NASDAQCOM'].iloc[0]
     d.index.name='Date';d=d.reset_index();d['Date']=d['Date'].dt.strftime('%Y-%m-%d')
     # atomic writes only after all upstream sources pass validation
-    meta={'last_refresh_utc':datetime.now(timezone.utc).isoformat(timespec='seconds'),'start_date':d.iloc[0]['Date'], 'end_date':d.iloc[-1]['Date'],'asof': {k:str(v.index[-1].date()) for k,v in f.items()}|{'TGA':str(t.index[-1].date())},'source':'Official FRED & U.S. Treasury FiscalData'}
+    meta={'last_refresh_utc':datetime.now(timezone.utc).isoformat(timespec='seconds'),'start_date':d.iloc[0]['Date'], 'end_date':d.iloc[-1]['Date'],'asof': {k:str(v.index[-1].date()) for k,v in f.items()}|{'TGA':str(t.index[-1].date())},'source':'FRED-origin series via DBnomics mirror or FRED direct; TGA via official U.S. Treasury FiscalData'}
     recent=d.round(9).to_dict(orient='records')
     # Preserve and append all observations since 2020; recalculate scores and tests on entire history.
     # Scores must use preceding 20 sessions, never future observations.
