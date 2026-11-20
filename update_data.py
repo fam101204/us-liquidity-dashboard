@@ -216,5 +216,6 @@ def main():
 if __name__=='__main__':
     try:
         if '--check' in sys.argv: check_sources()
+            # V7 update test
         else: main()
     except Exception as e:print('UPDATE FAILED; existing snapshot preserved:',e,file=sys.stderr);sys.exit(1)
