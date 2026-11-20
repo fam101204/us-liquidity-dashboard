@@ -1,29 +1,44 @@
 name: Refresh official liquidity data
 
 on:
-  schedule:
-    - cron: '20 23 * * 1-5'
   workflow_dispatch:
+  schedule:
+    - cron: '20 23 * * 1-5'  # 08:20 Asia/Seoul Tue-Sat
 
 permissions:
   contents: write
 
+concurrency:
+  group: us-liquidity-refresh
+  cancel-in-progress: false
+
 jobs:
   refresh:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install -r requirements.txt
-      - run: python update_data.py
-      - name: Commit updated data
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Check official API connectivity
+        run: python update_data.py --check
+      - name: Refresh data and historical score
+        run: python update_data.py
+      - name: Commit refreshed data if changed
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add data/latest.json data/observation_history.json data/score_history.json data/forward_analysis.json
           if ! git diff --cached --quiet; then
-            git commit -m 'Update official US liquidity data'
+            git commit -m 'Refresh official US liquidity observations'
             git push
+          else
+            echo 'No data changes to commit'
           fi
