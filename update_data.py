@@ -110,51 +110,84 @@ def check_sources():
         raise RuntimeError(f'미국 재무부 API 조회 실패: HTTP {r.status_code}')
     print('미국 재무부 API 접속 성공',flush=True)
 
-def treasury():
-    """Load every DTS API page, including pre-2021 Federal Reserve Account naming.
-    Important: close_today_bal is empty for post-April 2022 TGA closing rows;
-    the Treasury stores closing balance in open_today_bal for those rows.
-    DTS values are millions of dollars.
+def select_tga_rows(allrows):
+    """Select the official closing TGA balance across the April 2022 DTS change.
+
+    Before 2022-04-18 the closing amount is in close_today_bal on account_type
+    'Federal Reserve Account' (through Sep 2021), then 'Treasury General Account (TGA)'.
+    From 2022-04-18 the account_type is 'Treasury General Account (TGA) Closing Balance'
+    and its open_today_bal field contains the closing amount.
+    Values are USD millions. Never use opening balance as a fallback for old rows.
     """
+    d=pd.DataFrame(allrows)
+    required={'record_date','account_type','open_today_bal','close_today_bal'}
+    if not required.issubset(d.columns):
+        raise ValueError(f'Treasury fields missing: {sorted(required-set(d.columns))}')
+    d['record_date']=pd.to_datetime(d['record_date'], errors='coerce')
+    ac=(d['account_type'].fillna('').astype(str).str.strip()
+        .str.replace(r'\s+', ' ', regex=True).str.casefold())
+    cutoff=pd.Timestamp('2022-04-18')
+    # Historical DTS: the *same account's* closing value was in close_today_bal.
+    legacy=(d['record_date'] < cutoff) & ac.isin({
+        'federal reserve account',
+        'treasury general account',
+        'treasury general account (tga)',
+    })
+    # Current DTS: only the explicit TGA Closing Balance row is eligible.
+    modern=(d['record_date'] >= cutoff) & ac.isin({
+        'treasury general account (tga) closing balance',
+        'treasury general account closing balance',
+    })
+    historic=d.loc[legacy, ['record_date','close_today_bal']].copy()
+    historic['TGA']=pd.to_numeric(historic['close_today_bal'],errors='coerce')
+    newer=d.loc[modern, ['record_date','open_today_bal']].copy()
+    newer['TGA']=pd.to_numeric(newer['open_today_bal'],errors='coerce')
+    counts=(len(historic),len(newer))
+    if not all(counts):
+        sample=d.loc[d['record_date'] < cutoff, 'account_type'].dropna().unique()[:12].tolist()
+        raise ValueError(f'TGA historical/current records missing; counts={counts}; '
+                         f'older account types={sample}')
+    chosen=pd.concat([historic[['record_date','TGA']],newer[['record_date','TGA']]],ignore_index=True)
+    if chosen[['record_date','TGA']].isna().any().any():
+        bad=chosen[chosen[['record_date','TGA']].isna().any(axis=1)].head(5)
+        raise ValueError(f'TGA closing-balance source contains missing values: {bad.to_dict("records")}')
+    if chosen['record_date'].duplicated().any():
+        bad=chosen[chosen['record_date'].duplicated(keep=False)].head(5)
+        raise ValueError(f'TGA duplicate source dates: {bad.to_dict("records")}')
+    t=chosen.set_index('record_date')['TGA'].sort_index()
+    if t.index.min()>pd.Timestamp('2020-01-02'):
+        raise ValueError(f'TGA data does not reach 2020; earliest={t.index.min().date()}')
+    if (pd.Timestamp.today().normalize()-t.index.max()).days>10:
+        raise ValueError(f'Treasury TGA stale: last={t.index.max().date()}')
+    print(f'[Treasury TGA] selected {len(historic)} historical and {len(newer)} modern records; '
+          f'{t.index.min().date()} ~ {t.index.max().date()}',flush=True)
+    return t
+
+
+def treasury():
+    """Load official US Treasury DTS operating-cash-balance API, all pages."""
     endpoint='https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v1/accounting/dts/operating_cash_balance'
     params={'filter':f'record_date:gte:{START}',
             'fields':'record_date,account_type,open_today_bal,close_today_bal',
             'page[size]':'5000','sort':'record_date'}
-    allrows=[]; page=1; total_pages=1
+    allrows=[];page=1;total_pages=1
     while page<=total_pages:
         print(f'Treasury page {page}/{total_pages}',flush=True)
         params['page[number]']=str(page)
         body=download(endpoint,params,secs=70).json()
         meta=body.get('meta',{})
         total_pages=int(meta.get('total-pages',1))
-        if total_pages>100: raise ValueError('Unexpected Treasury page count')
+        if total_pages>100:raise ValueError('Unexpected Treasury page count')
         part=body.get('data',[])
-        if not isinstance(part,list) or not part: raise ValueError(f'Empty Treasury page {page}')
+        if not isinstance(part,list) or not part:raise ValueError(f'Empty Treasury page {page}')
         allrows.extend(part);page+=1
-    d=pd.DataFrame(allrows)
-    required={'record_date','account_type','open_today_bal','close_today_bal'}
-    if not required.issubset(d):raise ValueError('Treasury fields missing')
-    ac=d['account_type'].astype(str).str.lower()
-    # Pre-Oct 2021 Federal Reserve Account; newer Treasury General Account.
-    mask=ac.str.contains(r'(treasury general account|federal reserve account|\btga\b)',regex=True) & ac.str.contains('closing balance')
-    d=d.loc[mask].copy()
-    d['record_date']=pd.to_datetime(d['record_date'],errors='coerce')
-    # DTS changed the closing-balance storage field in April 2022.
-    # For a closing-balance row, use close_today_bal when present; else open_today_bal.
-    close=pd.to_numeric(d['close_today_bal'],errors='coerce')
-    open_=pd.to_numeric(d['open_today_bal'],errors='coerce')
-    d['TGA']=close.combine_first(open_)
-    d=d.dropna(subset=['record_date','TGA'])
-    if d.empty: raise ValueError('No TGA closing-balance records: inspect account_type names')
-    if d['record_date'].duplicated().any():
-        dup=d.loc[d['record_date'].duplicated(),['record_date','account_type']]
-        raise ValueError(f'Duplicate TGA dates: {dup.head().to_dict("records")}')
-    t=d.set_index('record_date')['TGA'].sort_index()
-    if (pd.Timestamp.today().normalize()-t.index.max()).days>10:raise ValueError('Treasury TGA stale')
-    return t
+    return select_tga_rows(allrows)
+
 
 def asof(series,dates,lag=0,div=1):
-    s=series.copy();s.index=s.index+pd.Timedelta(days=lag)
+    s=series.copy()
+    if lag:
+        s.index=s.index+pd.DateOffset(days=int(lag))
     return s.reindex(s.index.union(dates)).sort_index().ffill().reindex(dates)/div
 
 def main():
@@ -175,8 +208,14 @@ def main():
     # HY OAS is only distributed by FRED for the latest ~3 years (since Apr 2026).
     # Keep earlier HY observations and scores missing; NEVER backfill synthetic prices.
     mandatory=[k for k in d.columns if k!='HY_OAS_pct']
-    if d[mandatory].isna().any().any():
-        raise ValueError('핵심 시계열에 결측값: 초기 정렬 또는 원자료 확인 필요')
+    missing=d[mandatory].isna().sum()
+    missing=missing[missing>0]
+    if not missing.empty:
+        details={k:{'count':int(v),
+                    'first_missing':str(d.index[d[k].isna()][0].date()),
+                    'first_source': ('TGA' if k=='TGA_USD_trillion' else k)}
+                 for k,v in missing.items()}
+        raise ValueError(f'핵심 시계열 결측: {details}. TGA 계좌명/원자료를 확인하세요.')
     d['Net_Liquidity_USD_trillion']=d['Fed_USD_trillion']-d['TGA_USD_trillion']-d['RRP_USD_trillion']
     d['Net_Liquidity_Index_100']=100*d['Net_Liquidity_USD_trillion']/d['Net_Liquidity_USD_trillion'].iloc[0]
     d['NASDAQ_Index_100']=100*d['NASDAQCOM']/d['NASDAQCOM'].iloc[0]
@@ -216,6 +255,5 @@ def main():
 if __name__=='__main__':
     try:
         if '--check' in sys.argv: check_sources()
-            # V7 update test
         else: main()
     except Exception as e:print('UPDATE FAILED; existing snapshot preserved:',e,file=sys.stderr);sys.exit(1)
