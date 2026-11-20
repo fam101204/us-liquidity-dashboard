@@ -39,55 +39,76 @@ def _validate_fred_series(code, out, source):
     return out
 
 
-def _fred_graph(code):
-    # FRED direct source (API key not required). This host has timed out on GitHub Actions.
-    r=download('https://fred.stlouisfed.org/graph/fredgraph.csv',
-               {'id':code,'cosd':START},secs=10)
-    d=pd.read_csv(io.BytesIO(r.content),na_values=['.'])
-    d.columns=[str(c).strip().upper() for c in d.columns]
-    dcol='OBSERVATION_DATE' if 'OBSERVATION_DATE' in d else 'DATE'
-    if code not in d or dcol not in d: raise ValueError(f'{code} invalid FRED CSV columns')
-    d[dcol]=pd.to_datetime(d[dcol],errors='coerce')
-    d[code]=pd.to_numeric(d[code],errors='coerce')
-    return _validate_fred_series(code,d.dropna(subset=[dcol,code]).set_index(dcol)[code], 'FRED')
-
-
-def _dbnomics_fred(code):
-    # DBnomics is an independent aggregator/mirror, not the official FRED service.
-    # Its FRED series preserve the original series ID and measurement units.
-    url=f'https://api.db.nomics.world/v22/series/FRED/{code}'
-    r=S.get(url,params={'observations':'1'},timeout=(10,22))
-    r.raise_for_status()
-    body=r.json()
-    docs=body.get('series',{}).get('docs',[])
-    if len(docs)!=1: raise ValueError(f'{code} DBnomics: expected exactly one series')
-    doc=docs[0]
-    periods=doc.get('period',[])
-    vals=doc.get('value',[])
-    if len(periods)!=len(vals) or not periods:
-        raise ValueError(f'{code} DBnomics: malformed observation arrays')
-    dates=pd.to_datetime(pd.Series(periods),errors='coerce')
-    numbers=pd.to_numeric(pd.Series(vals),errors='coerce')
-    out=pd.Series(numbers.to_numpy(),index=pd.DatetimeIndex(dates),name=code)
-    out=out.dropna()
-    return _validate_fred_series(code,out,'DBnomics FRED mirror')
-
-
 def fred(code):
-    # Independent mirror first due to repeated FRED host timeouts on the user's runner.
-    # Never treat an old mirror snapshot as up-to-date.
-    errors=[]
-    for label,func in [('DBnomics FRED mirror',_dbnomics_fred),
-                       ('FRED direct',_fred_graph)]:
+    """Official FRED API v1, with a GitHub Actions secret (no scraped CSV/mirrors)."""
+    key=os.environ.get('FRED_API_KEY','').strip()
+    if not key:
+        raise RuntimeError('FRED_API_KEY 미설정: GitHub Settings > Secrets and variables > Actions 에 등록하세요.')
+    if not (len(key)==32 and key.isalnum()):
+        raise RuntimeError('FRED_API_KEY 형식 오류: 32자 영문/숫자 키를 다시 확인하세요.')
+    url='https://api.stlouisfed.org/fred/series/observations'
+    params={'series_id':code, 'api_key':key, 'file_type':'json',
+            'observation_start':START, 'sort_order':'asc'}
+    error=None
+    for attempt in range(1,4):
         try:
-            print(f'[{code}] Fetching {label}',flush=True)
-            values=func(code)
-            print(f'[{code}] OK via {label}, latest={values.index.max().date()}, n={len(values)}',flush=True)
-            return values
-        except (requests.RequestException,ValueError,RuntimeError,KeyError,TypeError) as exc:
-            print(f'[{code}] {label} failed: {type(exc).__name__}: {exc}',flush=True)
-            errors.append(f'{label}: {type(exc).__name__}: {exc}')
-    raise RuntimeError(f'{code} both providers failed: '+'; '.join(errors))
+            r=S.get(url,params=params,timeout=(15,35))
+            if r.status_code!=200:
+                # Don't print the response URL or untrusted bodies, to avoid leaking the API key.
+                raise RuntimeError(f'HTTP {r.status_code} (인증 오류 400/401이면 API 키를 확인하세요)')
+            body=r.json()
+            obs=body.get('observations')
+            if not isinstance(obs,list) or not obs:
+                raise ValueError('observations 배열 없음: FRED 응답 형식 확인 필요')
+            frame=pd.DataFrame(obs)
+            if not {'date','value'}.issubset(frame.columns):
+                raise ValueError('date/value 컬럼 없음')
+            frame['date']=pd.to_datetime(frame['date'],errors='coerce')
+            frame['value']=pd.to_numeric(frame['value'],errors='coerce')
+            series=frame.dropna(subset=['date','value']).set_index('date')['value']
+            series.name=code
+            output=_validate_fred_series(code,series,'FRED API v1')
+            print(f'[FRED {code}] 성공 | 관측치 {len(output)}개 | 최신 {output.index.max().date()}',flush=True)
+            return output
+        except (requests.RequestException,RuntimeError,ValueError,KeyError,TypeError) as e:
+            error=e
+            # Never show request URLs; they may contain the API credential.
+            detail = str(e) if isinstance(e,(RuntimeError,ValueError)) else '연결/응답 오류'
+            print(f'[FRED {code}] {attempt}/3 실패: {type(e).__name__}: {detail[:140]}',flush=True)
+            if isinstance(e,RuntimeError) and 'HTTP 4' in str(e):
+                break  # retrying invalid key has no benefit
+            if attempt<3: time.sleep(attempt*2)
+    raise RuntimeError(f'FRED 공식 API {code} 조회 실패: {type(error).__name__}. '
+                       f'공식 API 연결 및 GitHub Secret 설정을 확인하세요.')
+
+
+def check_sources():
+    """Connectivity check, without touching saved data."""
+    print('공식 데이터 연결 검사: 저장 데이터는 변경하지 않습니다.',flush=True)
+    key=os.environ.get('FRED_API_KEY','').strip()
+    if not(key and len(key)==32 and key.isalnum()):
+        raise RuntimeError('FRED_API_KEY 누락 또는 형식 오류. GitHub Actions Secrets를 먼저 설정하세요.')
+    url='https://api.stlouisfed.org/fred/series/observations'
+    try:
+        r=S.get(url,params={'api_key':key,'series_id':'WALCL','file_type':'json',
+                            'observation_start':(date.today()-timedelta(days=40)).isoformat()},
+                timeout=(15,35))
+    except requests.RequestException:
+        raise RuntimeError('FRED API 연결 실패: api.stlouisfed.org 접속 여부를 확인하세요.') from None
+    if r.status_code!=200:
+        raise RuntimeError(f'FRED API HTTP {r.status_code}: 다른 주소로 임의 전환하지 않습니다.')
+    body=r.json()
+    if not body.get('observations'):
+        raise RuntimeError('FRED API가 반환한 관측치가 없습니다.')
+    print('FRED API 인증 및 관측치 조회 성공',flush=True)
+    try:
+        r=S.get('https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v1/accounting/dts/operating_cash_balance',
+                params={'page[size]':'1','sort':'-record_date'},timeout=(15,35))
+    except requests.RequestException:
+        raise RuntimeError('미국 재무부 FiscalData API 연결 실패') from None
+    if r.status_code!=200 or not r.json().get('data'):
+        raise RuntimeError(f'미국 재무부 API 조회 실패: HTTP {r.status_code}')
+    print('미국 재무부 API 접속 성공',flush=True)
 
 def treasury():
     """Load every DTS API page, including pre-2021 Federal Reserve Account naming.
@@ -145,20 +166,25 @@ def main():
     if len(dates)<1200:raise ValueError('Historical Nasdaq observations insufficient; expected 2020 onward')
     d=pd.DataFrame(index=dates)
     d['NASDAQCOM']=f['NASDAQCOM'].reindex(dates)
-    d['Fed_USD_trillion']=asof(f['WALCL'],dates,lag=1,div=1e6)
+    d['Fed_USD_trillion']=asof(f['WALCL'],dates,lag=2,div=1e6)
     d['TGA_USD_trillion']=asof(t,dates,div=1e6)
     d['RRP_USD_trillion']=asof(f['RRPONTSYD'],dates,div=1e3)
-    d['Bank_Reserves_USD_trillion']=asof(f['WRESBAL'],dates,lag=1,div=1e6)
+    d['Bank_Reserves_USD_trillion']=asof(f['WRESBAL'],dates,lag=2,div=1e6)
     d['UST10Y_pct']=asof(f['DGS10'],dates)
     d['HY_OAS_pct']=asof(f['BAMLH0A0HYM2'],dates)
-    if d.isna().any().any():raise ValueError('Series contain missing values after alignment')
+    # HY OAS is only distributed by FRED for the latest ~3 years (since Apr 2026).
+    # Keep earlier HY observations and scores missing; NEVER backfill synthetic prices.
+    mandatory=[k for k in d.columns if k!='HY_OAS_pct']
+    if d[mandatory].isna().any().any():
+        raise ValueError('핵심 시계열에 결측값: 초기 정렬 또는 원자료 확인 필요')
     d['Net_Liquidity_USD_trillion']=d['Fed_USD_trillion']-d['TGA_USD_trillion']-d['RRP_USD_trillion']
     d['Net_Liquidity_Index_100']=100*d['Net_Liquidity_USD_trillion']/d['Net_Liquidity_USD_trillion'].iloc[0]
     d['NASDAQ_Index_100']=100*d['NASDAQCOM']/d['NASDAQCOM'].iloc[0]
     d.index.name='Date';d=d.reset_index();d['Date']=d['Date'].dt.strftime('%Y-%m-%d')
     # atomic writes only after all upstream sources pass validation
-    meta={'last_refresh_utc':datetime.now(timezone.utc).isoformat(timespec='seconds'),'start_date':d.iloc[0]['Date'], 'end_date':d.iloc[-1]['Date'],'asof': {k:str(v.index[-1].date()) for k,v in f.items()}|{'TGA':str(t.index[-1].date())},'source':'FRED-origin series via DBnomics mirror or FRED direct; TGA via official U.S. Treasury FiscalData'}
-    recent=d.round(9).to_dict(orient='records')
+    meta={'last_refresh_utc':datetime.now(timezone.utc).isoformat(timespec='seconds'),'start_date':d.iloc[0]['Date'], 'end_date':d.iloc[-1]['Date'],'asof': {k:str(v.index[-1].date()) for k,v in f.items()}|{'TGA':str(t.index[-1].date())},'source':'Official FRED API v1 + official U.S. Treasury FiscalData API'}
+    # to_json converts pre-2023 HY missing values to valid JSON null (not NaN).
+    recent=json.loads(d.to_json(orient='records',double_precision=9))
     # Preserve and append all observations since 2020; recalculate scores and tests on entire history.
     # Scores must use preceding 20 sessions, never future observations.
     hist_file=DIR/'observation_history.json'
@@ -173,6 +199,8 @@ def main():
     scores=score_from_rows(full)
     forward=build_forward_analysis(full,scores)
     meta['score_version']='v1'
+    meta['score_available_start']=next((r['Date'] for r in scores if r.get('score') is not None), None)
+    meta['limitation']='HY OAS available only ~3 years from FRED after Apr 2026. Earlier score dates intentionally null.'
     payload={'meta':meta,'rows':recent,'score_history':scores,'forward_analysis':forward}
     meta['history_rows']=len(full)
     meta['historical_backfill_start']=full[0]['Date']
@@ -186,5 +214,7 @@ def main():
     print('Updated',meta['end_date'])
 
 if __name__=='__main__':
-    try:main()
+    try:
+        if '--check' in sys.argv: check_sources()
+        else: main()
     except Exception as e:print('UPDATE FAILED; existing snapshot preserved:',e,file=sys.stderr);sys.exit(1)
